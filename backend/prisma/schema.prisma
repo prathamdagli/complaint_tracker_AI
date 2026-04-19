@@ -1,0 +1,69 @@
+// This is your Prisma schema file
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(uuid())
+  username      String         @unique
+  password      String
+  role          String         // ADMIN, CSE, QA, MANAGER, CUSTOMER
+  mobileNumber  String?
+  createdAt     DateTime       @default(now())
+  complaints    Complaint[]
+  notes         Note[]
+  notifications Notification[]
+}
+
+model Complaint {
+  id              String   @id @default(uuid())
+  ticketId        String   @unique @default(cuid())
+  text            String
+  category        String
+  priority        String
+  recommendation  String
+  sentiment       Float
+  status          String   @default("OPEN") // OPEN, IN_PROGRESS, RESOLVED, ESCALATED, WITHDRAWN
+  resolutionTime  Int?
+  validation_flag Boolean  @default(false)
+  explanation     String?
+  mobileNumber    String?
+  imageUrl        String?
+  withdrawnAt     DateTime?
+  withdrawnReason String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  userId          String?
+  User            User?    @relation(fields: [userId], references: [id])
+  notes           Note[]
+  notifications   Notification[]
+}
+
+model Note {
+  id          String    @id @default(uuid())
+  text        String
+  createdAt   DateTime  @default(now())
+  complaintId String
+  authorId    String
+  complaint   Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  author      User      @relation(fields: [authorId], references: [id])
+}
+
+model Notification {
+  id          String    @id @default(uuid())
+  title       String
+  message     String
+  type        String    @default("UPDATE") // UPDATE, STATUS_CHANGE, ESCALATION, RESOLUTION, SYSTEM
+  read        Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  userId      String
+  complaintId String?
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  complaint   Complaint? @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+}
