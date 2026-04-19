@@ -1,6 +1,5 @@
-const { PrismaClient } = require('@prisma/client');
+const { db, COLLECTIONS } = require('./firebase');
 const bcrypt = require('bcryptjs');
-const prisma = new PrismaClient();
 
 const users = [
     { username: 'admin@gmail.com', password: 'admin123', role: 'ADMIN' },
@@ -11,20 +10,29 @@ const users = [
 ];
 
 async function main() {
+    console.log('--- Initializing Database Seed ---');
+    const usersRef = db.collection(COLLECTIONS.USERS);
+
     for (const u of users) {
-        const existing = await prisma.user.findUnique({ where: { username: u.username } });
-        if (!existing) {
+        const snapshot = await usersRef.where('username', '==', u.username).get();
+        if (snapshot.empty) {
             const hashed = await bcrypt.hash(u.password, 10);
-            await prisma.user.create({
-                data: { username: u.username, password: hashed, role: u.role }
+            await usersRef.add({
+                username: u.username,
+                password: hashed,
+                role: u.role,
+                createdAt: new Date().toISOString()
             });
-            console.log(`Created ${u.role}: ${u.username} / ${u.password}`);
+            console.log(`✅ Created ${u.role}: ${u.username} / ${u.password}`);
         } else {
-            console.log(`${u.role} already exists: ${u.username}`);
+            console.log(`ℹ️ ${u.role} already exists: ${u.username}`);
         }
     }
+    console.log('--- Seed Finished ---');
+    process.exit(0);
 }
 
-main()
-    .catch(e => console.error(e))
-    .finally(() => prisma.$disconnect());
+main().catch(e => {
+    console.error('Seed failed:', e);
+    process.exit(1);
+});

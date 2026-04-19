@@ -1,7 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { PrismaClient } = require('@prisma/client');
+const { db, COLLECTIONS } = require('./firebase');
+const auth = require('./authMiddleware');
 const axios = require('axios');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -12,7 +13,7 @@ const { authenticateToken, requireRole, JWT_SECRET } = require('./authMiddleware
 const { notifyTelegramUser } = require('./bot'); // also initialises the Telegram bot
 const gemini = require('./geminiClient');
 
-const prisma = new PrismaClient();
+// Firebase Admin replaces Prisma
 const app = express();
 
 app.use(cors({ origin: true, credentials: true }));
@@ -53,9 +54,16 @@ const slaDeadline = (createdAt, priority) => {
 const pushNotification = async ({ userId, complaintId, title, message, type = 'UPDATE' }) => {
     if (!userId) return null;
     try {
-        const notification = await prisma.notification.create({
-            data: { userId, complaintId, title, message, type }
-        });
+        const notification = {
+            userId,
+            complaintId,
+            title,
+            message,
+            type,
+            read: false,
+            createdAt: new Date().toISOString()
+        };
+        await db.collection(COLLECTIONS.NOTIFICATIONS).add(notification);
         // Fan out to Telegram if this user originated from the bot (username starts with tg_)
         notifyTelegramUser(userId, { title, message }).catch(() => {});
         return notification;
@@ -72,17 +80,17 @@ app.post('/api/auth/register', async (req, res) => {
         const { username, password, mobileNumber } = req.body;
         if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
-        const existing = await prisma.user.findUnique({ where: { username } });
-        if (existing) return res.status(400).json({ error: 'Username taken' });
+        const usersRef = db.collection(COLLECTIONS.USERS);
+        const snapshot = await usersRef.where('username', '==', username).get();
+        if (!snapshot.empty) return res.status(400).json({ error: 'Username taken' });
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        await prisma.user.create({
-            data: {
-                username,
-                password: hashedPassword,
-                role: 'CUSTOMER',
-                mobileNumber: mobileNumber?.trim() || null
-            }
+        await usersRef.add({
+            username,
+            password: hashedPassword,
+            role: 'CUSTOMER',
+            mobileNumber: mobileNumber?.trim() || null,
+            createdAt: new Date().toISOString()
         });
         res.json({ success: true, message: 'Customer registered successfully' });
     } catch (err) {
@@ -94,8 +102,11 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { username, password } = req.body;
-        const user = await prisma.user.findUnique({ where: { username } });
-        if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+        const snapshot = await db.collection(COLLECTIONS.USERS).where('username', '==', username).get();
+        if (snapshot.empty) return res.status(400).json({ error: 'Invalid credentials' });
+        
+        const userDoc = snapshot.docs[0];
+        const user = { id: userDoc.id, ...userDoc.data() };
 
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) return res.status(400).json({ error: 'Invalid credentials' });
@@ -113,14 +124,16 @@ app.put('/api/auth/password', authenticateToken, async (req, res) => {
         if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Both current and new password are required' });
         if (newPassword.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
 
-        const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-        if (!user) return res.status(404).json({ error: 'User not found' });
+        const userRef = db.collection(COLLECTIONS.USERS).doc(req.user.id);
+        const userDoc = await userRef.get();
+        if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+        const user = userDoc.data();
 
         const isMatch = await bcrypt.compare(currentPassword, user.password);
         if (!isMatch) return res.status(400).json({ error: 'Current password is incorrect' });
 
         const hashed = await bcrypt.hash(newPassword, 10);
-        await prisma.user.update({ where: { id: req.user.id }, data: { password: hashed } });
+        await userRef.update({ password: hashed });
         res.json({ success: true, message: 'Password updated' });
     } catch (err) {
         console.error(err);
@@ -132,12 +145,10 @@ app.put('/api/auth/password', authenticateToken, async (req, res) => {
 
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     try {
-        const user = await prisma.user.findUnique({
-            where: { id: req.user.id },
-            select: { id: true, username: true, role: true, mobileNumber: true, createdAt: true }
-        });
-        if (!user) return res.status(404).json({ error: 'User not found' });
-        res.json(user);
+        const userDoc = await db.collection(COLLECTIONS.USERS).doc(req.user.id).get();
+        if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+        const data = userDoc.data();
+        res.json({ id: userDoc.id, username: data.username, role: data.role, mobileNumber: data.mobileNumber, createdAt: data.createdAt });
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
     }
@@ -147,12 +158,12 @@ app.put('/api/auth/profile', authenticateToken, async (req, res) => {
     try {
         const { mobileNumber } = req.body;
         const trimmed = typeof mobileNumber === 'string' ? mobileNumber.trim() : null;
-        const user = await prisma.user.update({
-            where: { id: req.user.id },
-            data: { mobileNumber: trimmed || null },
-            select: { id: true, username: true, role: true, mobileNumber: true }
-        });
-        res.json({ success: true, user });
+        const userRef = db.collection(COLLECTIONS.USERS).doc(req.user.id);
+        const userDoc = await userRef.get();
+        if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+
+        await userRef.update({ mobileNumber: trimmed || null });
+        res.json({ success: true, user: { id: userDoc.id, ...userDoc.data(), mobileNumber: trimmed || null } });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Server error' });
@@ -181,10 +192,8 @@ const rolesActorCanAssign = (actorRole) => actorRole === 'ADMIN' ? ALL_ROLES : M
 
 app.get('/api/admin/users', authenticateToken, requireRole(['ADMIN', 'MANAGER']), async (req, res) => {
     try {
-        const users = await prisma.user.findMany({
-            select: { id: true, username: true, role: true, createdAt: true },
-            orderBy: { createdAt: 'desc' }
-        });
+        const snapshot = await db.collection(COLLECTIONS.USERS).orderBy('createdAt', 'desc').get();
+        const users = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         res.json(users);
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
@@ -201,13 +210,18 @@ app.post('/api/admin/users', authenticateToken, requireRole(['ADMIN', 'MANAGER']
             return res.status(403).json({ error: `You cannot create a user with role ${role}. Allowed: ${allowed.join(', ')}` });
         }
 
-        const existing = await prisma.user.findUnique({ where: { username } });
-        if (existing) return res.status(400).json({ error: 'Username already taken' });
+        const usersRef = db.collection(COLLECTIONS.USERS);
+        const check = await usersRef.where('username', '==', username).get();
+        if (!check.empty) return res.status(400).json({ error: 'Username already taken' });
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        const user = await prisma.user.create({
-            data: { username, password: hashedPassword, role }
+        const userDoc = await usersRef.add({
+            username,
+            password: hashedPassword,
+            role,
+            createdAt: new Date().toISOString()
         });
+        const user = { id: userDoc.id, username, role };
 
         // Welcome notification for the newly created account
         await pushNotification({
@@ -231,11 +245,12 @@ app.put('/api/admin/users/:id', authenticateToken, requireRole(['ADMIN', 'MANAGE
         const { role, password } = req.body;
         if (id === req.user.id) return res.status(400).json({ error: 'Cannot modify your own account here' });
 
-        const target = await prisma.user.findUnique({ where: { id } });
-        if (!target) return res.status(404).json({ error: 'User not found' });
+        const userRef = db.collection(COLLECTIONS.USERS).doc(id);
+        const userDoc = await userRef.get();
+        if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+        const target = userDoc.data();
 
         const allowed = rolesActorCanAssign(req.user.role);
-        // Manager cannot touch ADMIN or other MANAGER accounts
         if (req.user.role === 'MANAGER' && !MANAGER_MANAGEABLE.includes(target.role)) {
             return res.status(403).json({ error: `Managers cannot modify ${target.role} accounts.` });
         }
@@ -250,10 +265,8 @@ app.put('/api/admin/users/:id', authenticateToken, requireRole(['ADMIN', 'MANAGE
             data.password = await bcrypt.hash(password, 10);
         }
 
-        const user = await prisma.user.update({
-            where: { id }, data, select: { id: true, username: true, role: true }
-        });
-        res.json({ success: true, user });
+        await userRef.update(data);
+        res.json({ success: true, user: { id, ...target, ...data } });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Server error' });
@@ -265,15 +278,24 @@ app.delete('/api/admin/users/:id', authenticateToken, requireRole(['ADMIN', 'MAN
         const { id } = req.params;
         if (id === req.user.id) return res.status(400).json({ error: 'Cannot delete your own account' });
 
-        const target = await prisma.user.findUnique({ where: { id } });
-        if (!target) return res.status(404).json({ error: 'User not found' });
+        const userRef = db.collection(COLLECTIONS.USERS).doc(id);
+        const userDoc = await userRef.get();
+        if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+        const target = userDoc.data();
 
         if (req.user.role === 'MANAGER' && !MANAGER_MANAGEABLE.includes(target.role)) {
             return res.status(403).json({ error: `Managers cannot delete ${target.role} accounts.` });
         }
 
-        await prisma.complaint.updateMany({ where: { userId: id }, data: { userId: null } });
-        await prisma.user.delete({ where: { id } });
+        // Set userId to null in their complaints before deleting the user
+        const complaintsSnapshot = await db.collection(COLLECTIONS.COMPLAINTS).where('userId', '==', id).get();
+        const batch = db.batch();
+        complaintsSnapshot.docs.forEach(doc => {
+            batch.update(doc.ref, { userId: null });
+        });
+        await batch.commit();
+
+        await userRef.delete();
         res.json({ success: true });
     } catch (err) {
         console.error(err);
@@ -293,11 +315,8 @@ app.post('/api/complaints', authenticateToken, async (req, res) => {
 
         // Fall back to the mobile stored on the customer's profile if omitted
         if ((!mobileNumber || !mobileNumber.trim()) && req.user.role === 'CUSTOMER') {
-            const profile = await prisma.user.findUnique({
-                where: { id: req.user.id },
-                select: { mobileNumber: true }
-            });
-            mobileNumber = profile?.mobileNumber || '';
+            const profileDoc = await db.collection(COLLECTIONS.USERS).doc(req.user.id).get();
+            mobileNumber = profileDoc.exists ? (profileDoc.data().mobileNumber || '') : '';
         }
         mobileNumber = (mobileNumber || '').trim();
 
@@ -310,21 +329,24 @@ app.post('/api/complaints', authenticateToken, async (req, res) => {
 
         const ticketId = generateTicketId();
 
-        const complaint = await prisma.complaint.create({
-            data: {
-                ticketId,
-                text,
-                category,
-                priority,
-                recommendation,
-                sentiment,
-                validation_flag,
-                explanation,
-                mobileNumber,
-                imageUrl,
-                userId: req.user.id
-            }
-        });
+        const complaintData = {
+            ticketId,
+            text,
+            category,
+            priority,
+            recommendation,
+            sentiment,
+            validation_flag,
+            explanation,
+            mobileNumber,
+            imageUrl,
+            userId: req.user.id,
+            status: 'OPEN',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
+        const complaintDoc = await db.collection(COLLECTIONS.COMPLAINTS).add(complaintData);
+        const complaint = { id: complaintDoc.id, ...complaintData };
 
         await pushNotification({
             userId: req.user.id,
@@ -344,17 +366,26 @@ app.post('/api/complaints', authenticateToken, async (req, res) => {
 app.get('/api/complaints', authenticateToken, requireRole(['CSE', 'QA', 'MANAGER', 'ADMIN']), async (req, res) => {
     try {
         const { status, priority, category, search } = req.query;
-        const where = {};
-        if (status) where.status = status;
-        if (priority) where.priority = priority;
-        if (category) where.category = category;
-        if (search) where.text = { contains: search };
+        let query = db.collection(COLLECTIONS.COMPLAINTS).orderBy('createdAt', 'desc');
+        if (status) query = query.where('status', '==', status);
+        if (priority) query = query.where('priority', '==', priority);
+        if (category) query = query.where('category', '==', category);
 
-        const complaints = await prisma.complaint.findMany({
-            where,
-            orderBy: { createdAt: 'desc' },
-            include: { User: { select: { username: true, id: true } } }
-        });
+        const snapshot = await query.get();
+        let complaints = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+        if (search) {
+            complaints = complaints.filter(c => c.text.toLowerCase().includes(search.toLowerCase()));
+        }
+
+        // Hydrate usernames
+        const userIds = [...new Set(complaints.map(c => c.userId).filter(Boolean))];
+        const users = {};
+        if (userIds.length > 0) {
+            const userSnapshots = await Promise.all(userIds.map(uid => db.collection(COLLECTIONS.USERS).doc(uid).get()));
+            userSnapshots.forEach(u => { if (u.exists) users[u.id] = u.data().username; });
+        }
+        complaints = complaints.map(c => ({ ...c, User: { username: users[c.userId] || 'Deleted User' } }));
         res.json(complaints);
     } catch (error) {
         console.error(error);
@@ -364,10 +395,8 @@ app.get('/api/complaints', authenticateToken, requireRole(['CSE', 'QA', 'MANAGER
 
 app.get('/api/complaints/me', authenticateToken, requireRole(['CUSTOMER']), async (req, res) => {
     try {
-        const complaints = await prisma.complaint.findMany({
-            where: { userId: req.user.id },
-            orderBy: { createdAt: 'desc' }
-        });
+        const snapshot = await db.collection(COLLECTIONS.COMPLAINTS).where('userId', '==', req.user.id).orderBy('createdAt', 'desc').get();
+        const complaints = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         res.json(complaints);
     } catch (error) {
         res.status(500).json({ error: 'Internal Server Error' });
@@ -377,22 +406,32 @@ app.get('/api/complaints/me', authenticateToken, requireRole(['CUSTOMER']), asyn
 app.get('/api/complaints/:id', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const complaint = await prisma.complaint.findUnique({
-            where: { id },
-            include: {
-                User: { select: { username: true, id: true } },
-                notes: {
-                    orderBy: { createdAt: 'desc' },
-                    include: { author: { select: { username: true, role: true } } }
-                }
-            }
-        });
-
-        if (!complaint) return res.status(404).json({ error: 'Complaint not found' });
+        const complaintDoc = await db.collection(COLLECTIONS.COMPLAINTS).doc(id).get();
+        if (!complaintDoc.exists) return res.status(404).json({ error: 'Complaint not found' });
+        const complaint = { id: complaintDoc.id, ...complaintDoc.data() };
 
         if (req.user.role === 'CUSTOMER' && complaint.userId !== req.user.id) {
             return res.status(403).json({ error: 'Unauthorized access to this complaint' });
         }
+
+        // Hydrate User
+        if (complaint.userId) {
+            const u = await db.collection(COLLECTIONS.USERS).doc(complaint.userId).get();
+            complaint.User = u.exists ? { username: u.data().username, id: u.id } : { username: 'Deleted User' };
+        }
+
+        // Hydrate Notes
+        const notesSnapshot = await db.collection(COLLECTIONS.NOTES).where('complaintId', '==', id).orderBy('createdAt', 'desc').get();
+        const notes = notesSnapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+        
+        // Hydrate Note Authors
+        const authorIds = [...new Set(notes.map(n => n.authorId))];
+        const authors = {};
+        if (authorIds.length > 0) {
+            const authorSnaps = await Promise.all(authorIds.map(aid => db.collection(COLLECTIONS.USERS).doc(aid).get()));
+            authorSnaps.forEach(s => { if (s.exists) authors[s.id] = { username: s.data().username, role: s.data().role }; });
+        }
+        complaint.notes = notes.map(n => ({ ...n, author: authors[n.authorId] || { username: '?', role: '?' } }));
 
         res.json(complaint);
     } catch (err) {
@@ -405,12 +444,13 @@ app.put('/api/complaints/:id', authenticateToken, requireRole(['CSE', 'QA', 'MAN
         const { id } = req.params;
         const { status, priority, category, resolutionTime } = req.body;
 
-        const current = await prisma.complaint.findUnique({ where: { id } });
-        if (!current) return res.status(404).json({ error: 'Complaint not found' });
+        const complaintRef = db.collection(COLLECTIONS.COMPLAINTS).doc(id);
+        const complaintDoc = await complaintRef.get();
+        if (!complaintDoc.exists) return res.status(404).json({ error: 'Complaint not found' });
+        const current = complaintDoc.data();
 
-        // CSE can only set OPEN/IN_PROGRESS/RESOLVED; superior roles can ESCALATE + change priority/category
         const superior = ['MANAGER', 'ADMIN'].includes(req.user.role);
-        const updateData = {};
+        const updateData = { updatedAt: new Date().toISOString() };
         if (status !== undefined) updateData.status = status;
         if (resolutionTime !== undefined) updateData.resolutionTime = resolutionTime;
         if (superior || req.user.role === 'QA') {
@@ -423,7 +463,8 @@ app.put('/api/complaints/:id', authenticateToken, requireRole(['CSE', 'QA', 'MAN
             updateData.resolutionTime = Math.max(1, Math.round(diffMs / 3600000));
         }
 
-        const updated = await prisma.complaint.update({ where: { id }, data: updateData });
+        await complaintRef.update(updateData);
+        const updated = { id, ...current, ...updateData };
 
         // If category was actually changed by a QA/Manager/Admin, teach the ML engine the correction.
         const categoryChanged = category !== undefined && category !== current.category;
@@ -468,8 +509,10 @@ app.delete('/api/complaints/:id', authenticateToken, requireRole(['QA', 'MANAGER
     try {
         const { id } = req.params;
         const { reason } = req.body || {};
-        const current = await prisma.complaint.findUnique({ where: { id } });
-        if (!current) return res.status(404).json({ error: 'Complaint not found' });
+        const complaintRef = db.collection(COLLECTIONS.COMPLAINTS).doc(id);
+        const complaintDoc = await complaintRef.get();
+        if (!complaintDoc.exists) return res.status(404).json({ error: 'Complaint not found' });
+        const current = complaintDoc.data();
 
         if (current.userId) {
             const isQA = req.user.role === 'QA';
@@ -486,7 +529,7 @@ app.delete('/api/complaints/:id', authenticateToken, requireRole(['QA', 'MANAGER
             });
         }
 
-        await prisma.complaint.delete({ where: { id } });
+        await complaintRef.delete();
         res.json({ success: true });
     } catch (err) {
         console.error(err);
@@ -502,8 +545,10 @@ app.post('/api/complaints/:id/withdraw', authenticateToken, async (req, res) => 
         const trimmedReason = (reason || '').toString().trim();
         if (!trimmedReason) return res.status(400).json({ error: 'Please share a reason so our team understands the context.' });
 
-        const complaint = await prisma.complaint.findUnique({ where: { id } });
-        if (!complaint) return res.status(404).json({ error: 'Complaint not found' });
+        const complaintRef = db.collection(COLLECTIONS.COMPLAINTS).doc(id);
+        const complaintDoc = await complaintRef.get();
+        if (!complaintDoc.exists) return res.status(404).json({ error: 'Complaint not found' });
+        const complaint = complaintDoc.data();
 
         if (req.user.role === 'CUSTOMER' && complaint.userId !== req.user.id) {
             return res.status(403).json({ error: 'You can only withdraw your own complaints.' });
@@ -512,14 +557,14 @@ app.post('/api/complaints/:id/withdraw', authenticateToken, async (req, res) => 
             return res.status(400).json({ error: 'This complaint has already been withdrawn.' });
         }
 
-        const updated = await prisma.complaint.update({
-            where: { id },
-            data: {
-                status: 'WITHDRAWN',
-                withdrawnAt: new Date(),
-                withdrawnReason: trimmedReason
-            }
-        });
+        const updatePayload = {
+            status: 'WITHDRAWN',
+            withdrawnAt: new Date().toISOString(),
+            withdrawnReason: trimmedReason,
+            updatedAt: new Date().toISOString()
+        };
+        await complaintRef.update(updatePayload);
+        const updated = { id, ...complaint, ...updatePayload };
 
         // Confirmation to the customer
         if (complaint.userId) {
@@ -533,12 +578,10 @@ app.post('/api/complaints/:id/withdraw', authenticateToken, async (req, res) => 
         }
 
         // Notify all staff (CSE / QA / MANAGER / ADMIN) that this complaint was taken back
-        const staff = await prisma.user.findMany({
-            where: { role: { in: ['CSE', 'QA', 'MANAGER', 'ADMIN'] } },
-            select: { id: true }
-        });
-        await Promise.all(staff.map(s => pushNotification({
-            userId: s.id,
+        const staffSnapshot = await db.collection(COLLECTIONS.USERS).where('role', 'in', ['CSE', 'QA', 'MANAGER', 'ADMIN']).get();
+        const staffIds = staffSnapshot.docs.map(d => d.id);
+        await Promise.all(staffIds.map(sid => pushNotification({
+            userId: sid,
             complaintId: id,
             title: `Complaint ${complaint.ticketId} withdrawn by customer`,
             message: `${req.user.username} withdrew complaint ${complaint.ticketId}. Reason: ${trimmedReason}.`,
@@ -557,12 +600,17 @@ app.post('/api/complaints/:id/withdraw', authenticateToken, async (req, res) => 
 app.get('/api/complaints/:id/notes', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const notes = await prisma.note.findMany({
-            where: { complaintId: id },
-            orderBy: { createdAt: 'desc' },
-            include: { author: { select: { username: true, role: true } } }
-        });
-        res.json(notes);
+        const notesSnapshot = await db.collection(COLLECTIONS.NOTES).where('complaintId', '==', id).orderBy('createdAt', 'desc').get();
+        const notes = notesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        
+        // Hydrate Authors
+        const authorIds = [...new Set(notes.map(n => n.authorId))];
+        const authors = {};
+        if (authorIds.length > 0) {
+            const authorSnaps = await Promise.all(authorIds.map(aid => db.collection(COLLECTIONS.USERS).doc(aid).get()));
+            authorSnaps.forEach(s => { if (s.exists) authors[s.id] = { username: s.data().username, role: s.data().role }; });
+        }
+        res.json(notes.map(n => ({ ...n, author: authors[n.authorId] || { username: '?', role: '?' } })));
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
     }
@@ -574,14 +622,17 @@ app.post('/api/complaints/:id/notes', authenticateToken, requireRole(['CSE', 'QA
         const { text } = req.body;
         if (!text || !text.trim()) return res.status(400).json({ error: 'Note text required' });
 
-        const complaint = await prisma.complaint.findUnique({ where: { id } });
-        if (!complaint) return res.status(404).json({ error: 'Complaint not found' });
+        const complaintDoc = await db.collection(COLLECTIONS.COMPLAINTS).doc(id).get();
+        if (!complaintDoc.exists) return res.status(404).json({ error: 'Complaint not found' });
 
-        const note = await prisma.note.create({
-            data: { text: text.trim(), complaintId: id, authorId: req.user.id },
-            include: { author: { select: { username: true, role: true } } }
-        });
-        res.json(note);
+        const noteData = {
+            text: text.trim(),
+            complaintId: id,
+            authorId: req.user.id,
+            createdAt: new Date().toISOString()
+        };
+        const noteDoc = await db.collection(COLLECTIONS.NOTES).add(noteData);
+        res.json({ id: noteDoc.id, ...noteData, author: { username: req.user.username, role: req.user.role } });
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
     }
@@ -591,11 +642,17 @@ app.post('/api/complaints/:id/notes', authenticateToken, requireRole(['CSE', 'QA
 
 app.get('/api/notifications', authenticateToken, async (req, res) => {
     try {
-        const notifications = await prisma.notification.findMany({
-            where: { userId: req.user.id },
-            orderBy: { createdAt: 'desc' },
-            include: { complaint: { select: { ticketId: true, status: true, category: true, priority: true } } }
-        });
+        const snapshot = await db.collection(COLLECTIONS.NOTIFICATIONS).where('userId', '==', req.user.id).orderBy('createdAt', 'desc').get();
+        let notifications = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+        // Hydrate Complaint info if needed
+        const complaintIds = [...new Set(notifications.map(n => n.complaintId).filter(Boolean))];
+        const complaintsMap = {};
+        if (complaintIds.length > 0) {
+            const complaintSnaps = await Promise.all(complaintIds.map(cid => db.collection(COLLECTIONS.COMPLAINTS).doc(cid).get()));
+            complaintSnaps.forEach(s => { if (s.exists) complaintsMap[s.id] = s.data(); });
+        }
+        notifications = notifications.map(n => ({ ...n, complaint: complaintsMap[n.complaintId] || null }));
         res.json(notifications);
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
@@ -604,10 +661,8 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 
 app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
     try {
-        const count = await prisma.notification.count({
-            where: { userId: req.user.id, read: false }
-        });
-        res.json({ count });
+        const snapshot = await db.collection(COLLECTIONS.NOTIFICATIONS).where('userId', '==', req.user.id).where('read', '==', false).get();
+        res.json({ count: snapshot.size });
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
     }
@@ -616,10 +671,11 @@ app.get('/api/notifications/unread-count', authenticateToken, async (req, res) =
 app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const notif = await prisma.notification.findUnique({ where: { id } });
-        if (!notif || notif.userId !== req.user.id) return res.status(404).json({ error: 'Notification not found' });
-        const updated = await prisma.notification.update({ where: { id }, data: { read: true } });
-        res.json(updated);
+        const notifRef = db.collection(COLLECTIONS.NOTIFICATIONS).doc(id);
+        const notifDoc = await notifRef.get();
+        if (!notifDoc.exists || notifDoc.data().userId !== req.user.id) return res.status(404).json({ error: 'Notification not found' });
+        await notifRef.update({ read: true });
+        res.json({ id, ...notifDoc.data(), read: true });
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
     }
@@ -627,10 +683,10 @@ app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
 
 app.put('/api/notifications/read-all', authenticateToken, async (req, res) => {
     try {
-        await prisma.notification.updateMany({
-            where: { userId: req.user.id, read: false },
-            data: { read: true }
-        });
+        const snapshot = await db.collection(COLLECTIONS.NOTIFICATIONS).where('userId', '==', req.user.id).where('read', '==', false).get();
+        const batch = db.batch();
+        snapshot.docs.forEach(doc => batch.update(doc.ref, { read: true }));
+        await batch.commit();
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
@@ -640,9 +696,10 @@ app.put('/api/notifications/read-all', authenticateToken, async (req, res) => {
 app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const notif = await prisma.notification.findUnique({ where: { id } });
-        if (!notif || notif.userId !== req.user.id) return res.status(404).json({ error: 'Notification not found' });
-        await prisma.notification.delete({ where: { id } });
+        const notifRef = db.collection(COLLECTIONS.NOTIFICATIONS).doc(id);
+        const notifDoc = await notifRef.get();
+        if (!notifDoc.exists || notifDoc.data().userId !== req.user.id) return res.status(404).json({ error: 'Notification not found' });
+        await notifRef.delete();
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: 'Server error' });
@@ -655,12 +712,14 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
     try {
         if (req.user.role === 'CUSTOMER') {
             const userId = req.user.id;
-            const total = await prisma.complaint.count({ where: { userId } });
-            const resolved = await prisma.complaint.count({ where: { userId, status: 'RESOLVED' } });
+            const complaintsSnap = await db.collection(COLLECTIONS.COMPLAINTS).where('userId', '==', userId).get();
+            const mine = complaintsSnap.docs.map(d => d.data());
+            
+            const total = mine.length;
+            const resolved = mine.filter(c => c.status === 'RESOLVED').length;
             const pending = total - resolved;
-            const highPriority = await prisma.complaint.count({ where: { userId, priority: 'High', status: { not: 'RESOLVED' } } });
+            const highPriority = mine.filter(c => c.priority === 'High' && c.status !== 'RESOLVED').length;
 
-            const mine = await prisma.complaint.findMany({ where: { userId } });
             const categories = {};
             mine.forEach(c => { categories[c.category] = (categories[c.category] || 0) + 1; });
 
@@ -671,10 +730,12 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
             return res.status(403).json({ error: 'Unauthorized' });
         }
 
-        const total = await prisma.complaint.count();
-        const resolved = await prisma.complaint.count({ where: { status: 'RESOLVED' } });
+        const complaintsSnap = await db.collection(COLLECTIONS.COMPLAINTS).get();
+        const allComplaints = complaintsSnap.docs.map(d => d.data());
+        
+        const total = allComplaints.length;
+        const resolvedCount = allComplaints.filter(c => c.status === 'RESOLVED').length;
 
-        const allComplaints = await prisma.complaint.findMany();
         const now = Date.now();
         const slaViolations = allComplaints.filter(c => {
             if (c.status === 'RESOLVED') return c.resolutionTime && c.resolutionTime > (SLA_HOURS[c.priority] || 72);
@@ -696,7 +757,10 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
             day.setDate(day.getDate() - i);
             const next = new Date(day);
             next.setDate(next.getDate() + 1);
-            const count = allComplaints.filter(c => new Date(c.createdAt) >= day && new Date(c.createdAt) < next).length;
+            const count = allComplaints.filter(c => {
+                const dt = new Date(c.createdAt);
+                return dt >= day && dt < next;
+            }).length;
             trend.push({ name: day.toLocaleDateString('en-US', { weekday: 'short' }), count });
         }
 
@@ -708,8 +772,8 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
 
         res.json({
             total,
-            resolved,
-            pending: total - resolved,
+            resolved: resolvedCount,
+            pending: total - resolvedCount,
             slaViolations,
             categories,
             priorities,
@@ -725,10 +789,17 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
 // SLA details per complaint
 app.get('/api/sla', authenticateToken, requireRole(['CSE', 'QA', 'MANAGER', 'ADMIN']), async (req, res) => {
     try {
-        const complaints = await prisma.complaint.findMany({
-            orderBy: { createdAt: 'desc' },
-            include: { User: { select: { username: true } } }
-        });
+        const complaintsSnap = await db.collection(COLLECTIONS.COMPLAINTS).orderBy('createdAt', 'desc').get();
+        const complaints = complaintsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+        // Hydrate usernames
+        const userIds = [...new Set(complaints.map(c => c.userId).filter(Boolean))];
+        const usersMap = {};
+        if (userIds.length > 0) {
+            const userSnaps = await Promise.all(userIds.map(uid => db.collection(COLLECTIONS.USERS).doc(uid).get()));
+            userSnaps.forEach(s => { if (s.exists) usersMap[s.id] = s.data().username; });
+        }
+
         const now = Date.now();
         const enriched = complaints.map(c => {
             const createdMs = new Date(c.createdAt).getTime();
@@ -739,6 +810,7 @@ app.get('/api/sla', authenticateToken, requireRole(['CSE', 'QA', 'MANAGER', 'ADM
                 : elapsedH > limitH;
             return {
                 ...c,
+                User: { username: usersMap[c.userId] || 'Deleted User' },
                 elapsedHours: Math.round(elapsedH * 10) / 10,
                 limitHours: limitH,
                 deadline: slaDeadline(c.createdAt, c.priority),
@@ -760,17 +832,29 @@ app.post('/api/complaints/:id/draft-reply', authenticateToken, requireRole(['CSE
         const { id } = req.params;
         const { tone = 'empathetic', instruction = '' } = req.body || {};
 
-        const complaint = await prisma.complaint.findUnique({
-            where: { id },
-            include: {
-                notes: { orderBy: { createdAt: 'desc' }, take: 5, include: { author: { select: { username: true, role: true } } } },
-                User: { select: { username: true } }
-            }
-        });
-        if (!complaint) return res.status(404).json({ error: 'Complaint not found' });
+        const complaintDoc = await db.collection(COLLECTIONS.COMPLAINTS).doc(id).get();
+        if (!complaintDoc.exists) return res.status(404).json({ error: 'Complaint not found' });
+        const complaint = { id: complaintDoc.id, ...complaintDoc.data() };
 
-        const noteSummary = (complaint.notes || []).slice().reverse().map(n =>
-            `- ${n.author?.username || '?'} (${n.author?.role || '?'}): ${n.text}`
+        // Hydrate User
+        if (complaint.userId) {
+            const u = await db.collection(COLLECTIONS.USERS).doc(complaint.userId).get();
+            complaint.User = u.exists ? { username: u.data().username } : { username: 'Customer' };
+        }
+
+        // Hydrate Notes
+        const notesSnapshot = await db.collection(COLLECTIONS.NOTES).where('complaintId', '==', id).orderBy('createdAt', 'desc').limit(5).get();
+        const notes = notesSnapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+
+        const authorIds = [...new Set(notes.map(n => n.authorId))];
+        const authors = {};
+        if (authorIds.length > 0) {
+            const authorSnaps = await Promise.all(authorIds.map(aid => db.collection(COLLECTIONS.USERS).doc(aid).get()));
+            authorSnaps.forEach(s => { if (s.exists) authors[s.id] = { username: s.data().username, role: s.data().role }; });
+        }
+
+        const noteSummary = notes.slice().reverse().map(n =>
+            `- ${authors[n.authorId]?.username || '?'} (${authors[n.authorId]?.role || '?'}): ${n.text}`
         ).join('\n') || '(no internal notes yet)';
 
         const systemPrompt = `You are a customer-support writer. Draft a short reply that a support agent will send to the CUSTOMER.

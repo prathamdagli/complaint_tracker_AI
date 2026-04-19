@@ -9,18 +9,7 @@
  *   to the user's Telegram chat whenever a web-side notification fires.
  */
 
-const TelegramBot = require('node-telegram-bot-api');
-const { PrismaClient } = require('@prisma/client');
-const axios = require('axios');
-const bcrypt = require('bcryptjs');
-const path = require('path');
-const fs = require('fs');
-const gemini = require('./geminiClient');
-
-const token = process.env.TELEGRAM_BOT_TOKEN;
-const ML_ENGINE_URL = process.env.ML_ENGINE_URL || 'http://localhost:8001';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-const prisma = new PrismaClient();
+const { db, COLLECTIONS } = require('./firebase');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -46,27 +35,30 @@ const generateTicketId = () => `CMP-${Math.floor(1000 + Math.random() * 9000)}`;
  */
 async function ensureUserForChat(chatId, mobileNumber) {
     const username = `tg_${chatId}`;
-    let user = await prisma.user.findUnique({ where: { username } });
-    if (user) {
-        if (mobileNumber && !user.mobileNumber) {
-            user = await prisma.user.update({
-                where: { id: user.id },
-                data: { mobileNumber }
-            });
+    const usersRef = db.collection(COLLECTIONS.USERS);
+    const snapshot = await usersRef.where('username', '==', username).get();
+    
+    if (!snapshot.empty) {
+        const userDoc = snapshot.docs[0];
+        let userData = userDoc.data();
+        if (mobileNumber && !userData.mobileNumber) {
+            await userDoc.ref.update({ mobileNumber });
+            userData.mobileNumber = mobileNumber;
         }
-        return { user, isNew: false, password: null };
+        return { user: { id: userDoc.id, ...userData }, isNew: false, password: null };
     }
+
     const password = randomPassword();
     const hashed = await bcrypt.hash(password, 10);
-    user = await prisma.user.create({
-        data: {
-            username,
-            password: hashed,
-            role: 'CUSTOMER',
-            mobileNumber: mobileNumber || null
-        }
-    });
-    return { user, isNew: true, password };
+    const newUser = {
+        username,
+        password: hashed,
+        role: 'CUSTOMER',
+        mobileNumber: mobileNumber || null,
+        createdAt: new Date().toISOString()
+    };
+    const userDoc = await usersRef.add(newUser);
+    return { user: { id: userDoc.id, ...newUser }, isNew: true, password };
 }
 
 async function downloadPhotoFromTelegram(photo) {
@@ -89,11 +81,12 @@ async function downloadPhotoFromTelegram(photo) {
 async function notifyTelegramUser(userId, { title, message }) {
     if (!bot) return;
     try {
-        const user = await prisma.user.findUnique({ where: { id: userId } });
-        if (!user || !user.username.startsWith('tg_')) return;
+        const userDoc = await db.collection(COLLECTIONS.USERS).doc(userId).get();
+        if (!userDoc.exists) return;
+        const user = userDoc.data();
+        if (!user.username || !user.username.startsWith('tg_')) return;
+        
         const chatId = user.username.slice(3);
-        // Plain text — avoids Markdown parse errors when title/message
-        // contain punctuation that Telegram treats as entity markers.
         const body = `🔔 ${title}\n\n${message}`;
         await bot.sendMessage(chatId, body);
     } catch (e) {
@@ -187,15 +180,18 @@ Type /cancel to abort.`,
     /* ---------- /mycomplaints ---------- */
     bot.onText(/^\/mycomplaints\b/, async (msg) => {
         const chatId = msg.chat.id;
-        const user = await prisma.user.findUnique({ where: { username: `tg_${chatId}` } });
-        if (!user) {
+        const snapshot = await db.collection(COLLECTIONS.USERS).where('username', '==', `tg_${chatId}`).get();
+        if (snapshot.empty) {
             return bot.sendMessage(chatId, "You haven't submitted any complaints yet. Type /submit to begin.");
         }
-        const complaints = await prisma.complaint.findMany({
-            where: { userId: user.id },
-            orderBy: { createdAt: 'desc' },
-            take: 10
-        });
+        const userId = snapshot.docs[0].id;
+        const complaintsSnap = await db.collection(COLLECTIONS.COMPLAINTS)
+            .where('userId', '==', userId)
+            .orderBy('createdAt', 'desc')
+            .limit(10)
+            .get();
+        
+        const complaints = complaintsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         if (!complaints.length) {
             return bot.sendMessage(chatId, "No complaints on record. Type /submit to begin.");
         }
@@ -218,18 +214,18 @@ Type /cancel to abort.`,
     /* ---------- /status (bare — show usage) ---------- */
     bot.onText(/^\/status\s*$/, async (msg) => {
         const chatId = msg.chat.id;
-        const user = await prisma.user.findUnique({ where: { username: `tg_${chatId}` } });
-        if (!user) {
-            return bot.sendMessage(chatId,
-                "Usage: /status CMP-1234\n\nYou haven't submitted any complaints yet. Type /submit to begin."
-            );
+        const snapshot = await db.collection(COLLECTIONS.USERS).where('username', '==', `tg_${chatId}`).get();
+        if (snapshot.empty) {
+            return bot.sendMessage(chatId, "Usage: /status CMP-1234\n\nYou haven't submitted any complaints yet. Type /submit to begin.");
         }
-        const recent = await prisma.complaint.findMany({
-            where: { userId: user.id },
-            orderBy: { createdAt: 'desc' },
-            take: 3,
-            select: { ticketId: true, status: true }
-        });
+        const userId = snapshot.docs[0].id;
+        const recentSnap = await db.collection(COLLECTIONS.COMPLAINTS)
+            .where('userId', '==', userId)
+            .orderBy('createdAt', 'desc')
+            .limit(3)
+            .get();
+        
+        const recent = recentSnap.docs.map(doc => doc.data());
         const hint = recent.length
             ? `\n\nYour most recent: ${recent.map(r => `${r.ticketId} (${r.status})`).join(', ')}`
             : '';
@@ -243,13 +239,27 @@ Type /cancel to abort.`,
         const ticket = match[1].trim();
         const chatId = msg.chat.id;
         try {
-            const complaint = await prisma.complaint.findFirst({
-                where: { OR: [{ ticketId: ticket }, { id: ticket }] },
-                include: { notes: { orderBy: { createdAt: 'desc' }, take: 3, include: { author: { select: { username: true, role: true } } } } }
-            });
-            if (!complaint) {
+            // Firestore doesn't support OR natively for different fields easily, standard with CMP prefix anyway
+            let snapshot = await db.collection(COLLECTIONS.COMPLAINTS).where('ticketId', '==', ticket).get();
+            if (snapshot.empty) {
+                // Try looking up by Firestore ID
+                const doc = await db.collection(COLLECTIONS.COMPLAINTS).doc(ticket).get();
+                if (doc.exists) {
+                    snapshot = { docs: [doc], empty: false };
+                }
+            }
+
+            if (snapshot.empty) {
                 return bot.sendMessage(chatId, `Ticket "${ticket}" not found. Type /mycomplaints to see your tickets.`);
             }
+            
+            const complaintDoc = snapshot.docs[0];
+            const complaint = { id: complaintDoc.id, ...complaintDoc.data() };
+
+            // Fetch Notes
+            const notesSnapshot = await db.collection(COLLECTIONS.NOTES).where('complaintId', '==', complaint.id).orderBy('createdAt', 'desc').limit(3).get();
+            const notes = notesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
             const reply = [
                 `${complaint.ticketId} — ${complaint.status}`,
                 ``,
@@ -262,14 +272,19 @@ Type /cancel to abort.`,
                 complaint.withdrawnAt ? `Withdrawn: ${new Date(complaint.withdrawnAt).toLocaleString()}` : null
             ].filter(Boolean);
 
-            if (complaint.notes && complaint.notes.length > 0) {
+            if (notes.length > 0) {
                 reply.push('', '--- Latest notes from support ---');
-                for (const n of complaint.notes) {
-                    reply.push(`• ${n.author?.username || '?'} (${n.author?.role || '?'}): ${n.text.slice(0, 160)}`);
+                // Hydrate Authors
+                const authorIds = [...new Set(notes.map(n => n.authorId))];
+                const authors = {};
+                const authorSnaps = await Promise.all(authorIds.map(aid => db.collection(COLLECTIONS.USERS).doc(aid).get()));
+                authorSnaps.forEach(s => { if (s.exists) authors[s.id] = s.data(); });
+
+                for (const n of notes) {
+                    const author = authors[n.authorId];
+                    reply.push(`• ${author?.username || '?'} (${author?.role || '?'}): ${n.text.slice(0, 160)}`);
                 }
             }
-            // Plain text — avoids parse errors when complaint text contains
-            // characters Telegram treats as Markdown entity markers.
             await bot.sendMessage(chatId, reply.join('\n'));
         } catch (err) {
             console.error('[tg] /status failed:', err.message);
@@ -280,18 +295,19 @@ Type /cancel to abort.`,
     /* ---------- /account ---------- */
     bot.onText(/^\/account\b/, async (msg) => {
         const chatId = msg.chat.id;
-        const user = await prisma.user.findUnique({ where: { username: `tg_${chatId}` } });
-        if (!user) {
+        const snapshot = await db.collection(COLLECTIONS.USERS).where('username', '==', `tg_${chatId}`).get();
+        if (snapshot.empty) {
             return bot.sendMessage(chatId, "No account yet. Submit a complaint first with /submit.");
         }
+        const user = snapshot.docs[0].data();
         bot.sendMessage(chatId,
 `*Your web-portal login*
-
+ 
 Username: \`${user.username}\`
 Password: _(use the one you got at registration)_
-
+ 
 🔗 Log in at ${FRONTEND_URL}/login
-
+ 
 Forgot your password? Type /resetpassword.`,
             { parse_mode: 'Markdown' }
         );
@@ -300,19 +316,20 @@ Forgot your password? Type /resetpassword.`,
     /* ---------- /resetpassword ---------- */
     bot.onText(/^\/resetpassword\b/, async (msg) => {
         const chatId = msg.chat.id;
-        const user = await prisma.user.findUnique({ where: { username: `tg_${chatId}` } });
-        if (!user) {
+        const snapshot = await db.collection(COLLECTIONS.USERS).where('username', '==', `tg_${chatId}`).get();
+        if (snapshot.empty) {
             return bot.sendMessage(chatId, "No account yet. Submit a complaint first with /submit.");
         }
+        const userDoc = snapshot.docs[0];
         const pwd = randomPassword();
         const hashed = await bcrypt.hash(pwd, 10);
-        await prisma.user.update({ where: { id: user.id }, data: { password: hashed } });
+        await userDoc.ref.update({ password: hashed });
         bot.sendMessage(chatId,
 `🔐 *New temporary password*
-
-Username: \`${user.username}\`
+ 
+Username: \`${userDoc.data().username}\`
 Password: \`${pwd}\`
-
+ 
 Log in at ${FRONTEND_URL}/login and change it under Settings → Password.`,
             { parse_mode: 'Markdown' }
         );
@@ -326,15 +343,17 @@ Log in at ${FRONTEND_URL}/login and change it under Settings → Password.`,
             return bot.sendMessage(chatId, "The AI assistant isn't configured on this server yet.");
         }
         try {
-            const user = await prisma.user.findUnique({ where: { username: `tg_${chatId}` } });
+            const snapshot = await db.collection(COLLECTIONS.USERS).where('username', '==', `tg_${chatId}`).get();
             let contextBlock = '';
-            if (user) {
-                const complaints = await prisma.complaint.findMany({
-                    where: { userId: user.id },
-                    orderBy: { createdAt: 'desc' },
-                    take: 10,
-                    select: { ticketId: true, text: true, category: true, priority: true, status: true, recommendation: true, createdAt: true, withdrawnReason: true }
-                });
+            if (!snapshot.empty) {
+                const userDoc = snapshot.docs[0];
+                const complaintsSnap = await db.collection(COLLECTIONS.COMPLAINTS)
+                    .where('userId', '==', userDoc.id)
+                    .orderBy('createdAt', 'desc')
+                    .limit(10)
+                    .get();
+                
+                const complaints = complaintsSnap.docs.map(doc => doc.data());
                 const lines = complaints.map(c =>
                     `- ${c.ticketId} [${c.status}] ${c.category}/${c.priority} | ${new Date(c.createdAt).toLocaleDateString()} | "${c.text.slice(0, 100)}${c.text.length > 100 ? '...' : ''}" | rec: ${c.recommendation}`
                 );
@@ -440,32 +459,35 @@ ${contextBlock}`;
                     const mlResponse = await axios.post(`${ML_ENGINE_URL}/analyze`, { text });
                     const { category, priority, sentiment, recommendation, validation_flag, explanation } = mlResponse.data;
 
-                    const complaint = await prisma.complaint.create({
-                        data: {
-                            ticketId: generateTicketId(),
-                            text,
-                            category,
-                            priority,
-                            recommendation,
-                            sentiment,
-                            validation_flag,
-                            explanation,
-                            mobileNumber: user.mobileNumber || mobileNumber || null,
-                            imageUrl,
-                            userId: user.id
-                        }
-                    });
+                    const complaintData = {
+                        ticketId: generateTicketId(),
+                        text,
+                        category,
+                        priority,
+                        recommendation,
+                        sentiment,
+                        validation_flag,
+                        explanation,
+                        mobileNumber: user.mobileNumber || mobileNumber || null,
+                        imageUrl,
+                        userId: user.id,
+                        status: 'OPEN',
+                        createdAt: new Date().toISOString(),
+                        updatedAt: new Date().toISOString()
+                    };
+
+                    const complaintDoc = await db.collection(COLLECTIONS.COMPLAINTS).add(complaintData);
 
                     // Drop a notification so it also shows up in the web UI
                     try {
-                        await prisma.notification.create({
-                            data: {
-                                userId: user.id,
-                                complaintId: complaint.id,
-                                title: `Complaint ${complaint.ticketId} received (via Telegram)`,
-                                message: `AI tagged it as ${category}/${priority}. ${recommendation}`,
-                                type: 'UPDATE'
-                            }
+                        await db.collection(COLLECTIONS.NOTIFICATIONS).add({
+                            userId: user.id,
+                            complaintId: complaintDoc.id,
+                            title: `Complaint ${complaintData.ticketId} received (via Telegram)`,
+                            message: `AI tagged it as ${category}/${priority}. ${recommendation}`,
+                            type: 'UPDATE',
+                            read: false,
+                            createdAt: new Date().toISOString()
                         });
                     } catch (e) { /* non-fatal */ }
 
@@ -473,7 +495,7 @@ ${contextBlock}`;
                     const lines = [
                         `✅ *Complaint registered*`,
                         ``,
-                        `Ticket ID: \`${complaint.ticketId}\``,
+                        `Ticket ID: \`${complaintData.ticketId}\``,
                         `Category: *${category}*`,
                         `Priority: ${priIcon} *${priority}*`,
                         `Recommendation: _${recommendation}_`,
@@ -486,10 +508,10 @@ ${contextBlock}`;
                             `Password: \`${password}\``,
                             `Login at ${FRONTEND_URL}/login`,
                             ``,
-                            `You can track right here with /status ${complaint.ticketId} or /mycomplaints.`
+                            `You can track right here with /status ${complaintData.ticketId} or /mycomplaints.`
                         );
                     } else {
-                        lines.push(`Track it with /status ${complaint.ticketId} or /mycomplaints.`);
+                        lines.push(`Track it with /status ${complaintData.ticketId} or /mycomplaints.`);
                     }
                     bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'Markdown' });
                 } catch (err) {
